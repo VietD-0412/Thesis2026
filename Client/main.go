@@ -6,6 +6,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
@@ -29,9 +30,9 @@ func (f *forcedVariantTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
 func (f *forcedVariantTheme) Size(n fyne.ThemeSizeName) float32 { return theme.DefaultTheme().Size(n) }
 
 func main() {
-	myApp := app.New()
+	myApp := app.NewWithID("com.random.syncengine")
 	mainWindow := myApp.NewWindow("P2P Sync Engine")
-	mainWindow.Resize(fyne.NewSize(600, 450))
+	mainWindow.Resize(fyne.NewSize(1280, 720))
 
 	appTheme := &forcedVariantTheme{dark: true}
 	myApp.Settings().SetTheme(appTheme)
@@ -39,9 +40,27 @@ func main() {
 	idEntry := widget.NewEntry()
 	idEntry.SetText("Machine-A")
 
+	swarmKeyEntry := widget.NewPasswordEntry()
+	swarmKeyEntry.SetPlaceHolder("Example: ")
+
 	folderEntry := widget.NewEntry()
 	folderEntry.SetPlaceHolder("Example: ./SyncFolder")
 
+	var browseBtn *widget.Button
+	browseBtn = widget.NewButton("Browse", func() {
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil {
+				dialog.ShowError(err, mainWindow)
+				return
+			}
+			if uri == nil {
+				return
+			}
+			folderEntry.SetText(uri.Path())
+		}, mainWindow)
+	})
+
+	folderInputContainer := container.NewBorder(nil, nil, nil, browseBtn, folderEntry)
 	serverEntry := widget.NewEntry()
 	serverEntry.SetText("127.0.0.1:9000")
 
@@ -71,11 +90,13 @@ func main() {
 			folderEntry.Enable()
 			serverEntry.Enable()
 			themeSelect.Enable()
+			browseBtn.Enable()
 		} else {
 			idEntry.Disable()
 			folderEntry.Disable()
 			serverEntry.Disable()
 			themeSelect.Disable()
+			browseBtn.Disable()
 		}
 	}
 
@@ -88,7 +109,7 @@ func main() {
 		connectBtn.Disable()
 		toggleInputs(false)
 
-		err := StartEngine(idEntry.Text, folderEntry.Text, serverEntry.Text)
+		err := StartEngine(idEntry.Text, folderEntry.Text, serverEntry.Text, swarmKeyEntry.Text)
 
 		if err != nil {
 			connectBtn.Enable()
@@ -114,7 +135,8 @@ func main() {
 
 	form := widget.NewForm(
 		widget.NewFormItem("Client ID", idEntry),
-		widget.NewFormItem("Folder Path", folderEntry),
+		widget.NewFormItem("Group Key", swarmKeyEntry),
+		widget.NewFormItem("Folder Path", folderInputContainer),
 		widget.NewFormItem("Relay Server", serverEntry),
 		widget.NewFormItem("Theme", themeSelect),
 	)

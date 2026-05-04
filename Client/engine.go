@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -34,13 +35,17 @@ func logMsg(format string, a ...interface{}) {
 	}
 }
 
-func StartEngine(id, folder, serverIP string) error {
+func StartEngine(id, folder, serverIP, swarmKey string) error {
 	engineMutex.Lock()
 	defer engineMutex.Unlock()
 
 	os.MkdirAll(folder, os.ModePerm)
 
-	conn, err := net.Dial("tcp", serverIP)
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	conn, err := tls.Dial("tcp", serverIP, tlsConfig)
 	if err != nil {
 		logMsg("[CLIENT] Cannot connect to server: %v\n", err)
 		return err
@@ -48,7 +53,7 @@ func StartEngine(id, folder, serverIP string) error {
 
 	activeConn = conn
 	logMsg("[%s] Connected to Relay Server!\nMonitoring folder: %s\n", id, folder)
-	fmt.Fprintf(conn, "ID|%s\n", id)
+	fmt.Fprintf(conn, "ID|%s|%s\n", id, swarmKey)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {

@@ -1,115 +1,181 @@
 package main
 
 import (
-	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+type Client struct {
+	conn    net.Conn
+	id      string
+	swarmID string
+}
+
+type Swarm struct {
+	Clients map[string]*Client
+	Mu      sync.RWMutex
+}
 
 var (
-	clients = make(map[string]net.Conn)
-	mu      sync.Mutex
+	swarms   = make(map[string]*Swarm)
+	globalMu sync.RWMutex
 )
 
+const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024
+
 func main() {
-	port := "9000"
-	listener, err := net.Listen("tcp", ":"+port)
+	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
-		fmt.Println("[SERVER] Failed to start:", err)
+		fmt.Printf("[SECURE] Failed to load certificates: %v\n", err)
+		return
+	}
+
+	config := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	}
+
+	listener, err := tls.Listen("tcp", ":9000", config)
+	if err != nil {
+		fmt.Println("[SECURE] Failed to start:", err)
 		return
 	}
 	defer listener.Close()
 
-	fmt.Printf("[SERVER] Relay running on port %s. Waiting for clients...\n", port)
+	fmt.Println("[SECURE] Encrypted Relay running on port 9000")
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			continue
 		}
+
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+
 		go handleClient(conn)
 	}
 }
 
 func handleClient(conn net.Conn) {
-	reader := bufio.NewReader(conn)
+	defer conn.Close()
 
-	idMsg, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
+	handshake, err := readUntilNewline(conn)
+	if err != nil || !strings.HasPrefix(handshake, "ID|") {
 		return
 	}
 
-	idParts := strings.Split(strings.TrimSpace(idMsg), "|")
-	if len(idParts) != 2 || idParts[0] != "ID" {
-		conn.Close()
+	parts := strings.Split(strings.TrimSpace(handshake), "|")
+	if len(parts) != 3 {
+		fmt.Println("[SECURE] Rejected connection: Invalid handshake format.")
 		return
 	}
-	clientID := idParts[1]
 
-	mu.Lock()
-	clients[clientID] = conn
-	mu.Unlock()
-	fmt.Printf("[SERVER] %s connected. Total machines: %d\n", clientID, len(clients))
+	id := parts[1]
+	swarmID := parts[2]
+
+	conn.SetDeadline(time.Time{})
+	clientObj := &Client{conn: conn, id: id, swarmID: swarmID}
+
+	globalMu.Lock()
+	swarm, exists := swarms[swarmID]
+	if !exists {
+		swarm = &Swarm{Clients: make(map[string]*Client)}
+		swarms[swarmID] = swarm
+	}
+	globalMu.Unlock()
+
+	swarm.Mu.Lock()
+	swarm.Clients[id] = clientObj
+	swarm.Mu.Unlock()
+
+	fmt.Printf("[SECURE] %s joined swarm '%s'.\n", id, swarmID)
 
 	defer func() {
-		mu.Lock()
-		delete(clients, clientID)
-		mu.Unlock()
-		conn.Close()
-		fmt.Printf("[SERVER] %s disconnected.\n", clientID)
+		swarm.Mu.Lock()
+		delete(swarm.Clients, id)
+		swarm.Mu.Unlock()
+		fmt.Printf("[SECURE] %s left swarm '%s'.\n", id, swarmID)
 	}()
 
 	for {
-		header, err := reader.ReadString('\n')
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+
+		cmdLine, err := readUntilNewline(conn)
 		if err != nil {
-			return
+			break
 		}
 
-		parts := strings.Split(strings.TrimSpace(header), "|")
-		if parts[0] == "DELETE" && len(parts) == 2 {
-			fileName := parts[1]
-			fmt.Printf("[SERVER] Received DELETE for '%s' from %s. Broadcasting...\n", fileName, clientID)
+		cmdParts := strings.Split(cmdLine, "|")
+		if cmdParts[0] == "SYNC" && len(cmdParts) == 3 {
+			fileName := sanitizePath(cmdParts[1])
+			fileSize, _ := strconv.ParseInt(cmdParts[2], 10, 64)
 
-			mu.Lock()
-			for targetID, targetConn := range clients {
-				if targetID != clientID {
-					fmt.Fprintf(targetConn, "DELETE|%s\n", fileName)
-				}
+			if fileSize > MAX_FILE_SIZE {
+				fmt.Printf("[WARN] %s tried to send too large a file.\n", id)
+				return
 			}
-			mu.Unlock()
-			continue
+
+			broadcastFile(swarmID, id, fileName, fileSize, conn)
 		}
-
-		if len(parts) != 3 || parts[0] != "SYNC" {
-			continue
-		}
-
-		fileName := parts[1]
-		fileSize, _ := strconv.ParseInt(parts[2], 10, 64)
-
-		fmt.Printf("[SERVER] Received '%s' from %s. Broadcasting...\n", fileName, clientID)
-
-		fileData := make([]byte, fileSize)
-		_, err = io.ReadFull(reader, fileData)
-		if err != nil {
-			fmt.Println("[SERVER] Error reading file data:", err)
-			continue
-		}
-
-		mu.Lock()
-		for targetID, targetConn := range clients {
-			if targetID != clientID {
-				// Header
-				fmt.Fprintf(targetConn, "SYNC|%s|%d\n", fileName, fileSize)
-				// Data
-				targetConn.Write(fileData)
-			}
-		}
-		mu.Unlock()
 	}
+}
+
+func sanitizePath(path string) string {
+	path = strings.ReplaceAll(path, "..", "")
+	path = strings.ReplaceAll(path, "/", "")
+	path = strings.ReplaceAll(path, "\\", "")
+	return path
+}
+
+func broadcastFile(swarmID string, senderID string, fileName string, size int64, senderConn net.Conn) {
+	globalMu.RLock()
+	swarm, exists := swarms[swarmID]
+	globalMu.RUnlock()
+
+	if !exists {
+		io.CopyN(io.Discard, senderConn, size)
+		return
+	}
+
+	swarm.Mu.RLock()
+	var targets []io.Writer
+	for id, c := range swarm.Clients {
+		if id != senderID {
+			fmt.Fprintf(c.conn, "SYNC|%s|%d\n", fileName, size)
+			targets = append(targets, c.conn)
+		}
+	}
+	swarm.Mu.RUnlock()
+
+	if len(targets) > 0 {
+		mw := io.MultiWriter(targets...)
+		io.CopyN(mw, senderConn, size)
+	} else {
+		io.CopyN(io.Discard, senderConn, size)
+	}
+}
+
+func readUntilNewline(conn net.Conn) (string, error) {
+	var result []byte
+	one := make([]byte, 1)
+	for {
+		_, err := conn.Read(one)
+		if err != nil {
+			return "", err
+		}
+		if one[0] == '\n' {
+			break
+		}
+		result = append(result, one[0])
+		if len(result) > 1024 {
+			return "", fmt.Errorf("line too long")
+		}
+	}
+	return string(result), nil
 }
