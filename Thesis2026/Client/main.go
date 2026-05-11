@@ -2,6 +2,7 @@ package main
 
 import (
 	"image/color"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -78,10 +79,9 @@ func main() {
 	logArea.SetText("System Ready. Awaiting connection...\n")
 
 	UILogCallback = func(msg string) {
-		currentText := logArea.Text
-		logArea.SetText(currentText + msg + "\n")
-		logArea.CursorColumn = 0
-		logArea.CursorRow = len(logArea.Text)
+		logArea.SetText(logArea.Text + msg)
+		logArea.CursorRow = strings.Count(logArea.Text, "\n")
+		logArea.Refresh()
 	}
 
 	UIProgressCallback = func(val float64) {
