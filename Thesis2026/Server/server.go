@@ -8,15 +8,19 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,13 +33,141 @@ type Client struct {
 type FileRecord struct {
 	Size    int64
 	Hash    string
-	OwnerID string // last edited client
+	OwnerID string
 }
 
 type Swarm struct {
 	Clients map[string]*Client
-	Index   map[string]FileRecord // filename == latest known version
+	Index   map[string]FileRecord
 	Mu      sync.RWMutex
+}
+
+// ── Metrics ──────────────────────────────────────────────────────────────────
+
+type metrics struct {
+	BytesReceived  atomic.Int64
+	BytesSent      atomic.Int64
+	FilesRelayed   atomic.Int64
+	ActiveConns    atomic.Int64
+	TotalConns     atomic.Int64
+	ConflictsTotal atomic.Int64
+	startTime      time.Time
+}
+
+var stats = &metrics{
+	startTime: time.Now(),
+}
+
+type metricsSnapshot struct {
+	UptimeSeconds   float64 `json:"uptime_seconds"`
+	Goroutines      int     `json:"goroutines"`
+	ActiveConns     int64   `json:"active_connections"`
+	TotalConns      int64   `json:"total_connections"`
+	ActiveSwarms    int     `json:"active_swarms"`
+	TotalPeers      int     `json:"total_peers"`
+	BytesReceived   int64   `json:"bytes_received"`
+	BytesSent       int64   `json:"bytes_sent"`
+	BytesReceivedMB float64 `json:"bytes_received_mb"`
+	BytesSentMB     float64 `json:"bytes_sent_mb"`
+	FilesRelayed    int64   `json:"files_relayed"`
+	ConflictsTotal  int64   `json:"conflicts_total"`
+}
+
+func collectSnapshot() metricsSnapshot {
+	globalMu.RLock()
+	swarmCount := len(swarms)
+	peerCount := 0
+	for _, s := range swarms {
+		s.Mu.RLock()
+		peerCount += len(s.Clients)
+		s.Mu.RUnlock()
+	}
+	globalMu.RUnlock()
+
+	recv := stats.BytesReceived.Load()
+	sent := stats.BytesSent.Load()
+
+	return metricsSnapshot{
+		UptimeSeconds:   time.Since(stats.startTime).Seconds(),
+		Goroutines:      runtime.NumGoroutine(),
+		ActiveConns:     stats.ActiveConns.Load(),
+		TotalConns:      stats.TotalConns.Load(),
+		ActiveSwarms:    swarmCount,
+		TotalPeers:      peerCount,
+		BytesReceived:   recv,
+		BytesSent:       sent,
+		BytesReceivedMB: float64(recv) / (1024 * 1024),
+		BytesSentMB:     float64(sent) / (1024 * 1024),
+		FilesRelayed:    stats.FilesRelayed.Load(),
+		ConflictsTotal:  stats.ConflictsTotal.Load(),
+	}
+}
+
+func startMetricsServer() {
+	mux := http.NewServeMux()
+
+	// JSON endpoint — for programmatic access / thesis tooling
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(collectSnapshot())
+	})
+
+	// Human-readable dashboard — open in browser at http://localhost:9001/
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		s := collectSnapshot()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="3">
+<title>Relay Metrics</title>
+<style>
+  body { font-family: monospace; background: #0d1117; color: #e6edf3; padding: 2rem; }
+  h1   { color: #388bfd; margin-bottom: 0.25rem; }
+  .sub { color: #6e7681; font-size: 0.85rem; margin-bottom: 2rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.25rem; }
+  .card .val { font-size: 2rem; font-weight: bold; color: #388bfd; }
+  .card .lbl { font-size: 0.75rem; color: #6e7681; margin-top: 0.25rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .green { color: #23c55e; }
+  .amber { color: #d29922; }
+  table { width: 100%%; border-collapse: collapse; margin-top: 2rem; }
+  th { text-align: left; color: #6e7681; font-size: 0.75rem; padding: 0.5rem; border-bottom: 1px solid #30363d; }
+  td { padding: 0.5rem; border-bottom: 1px solid #21262d; }
+  .badge { display:inline-block; padding:0.15rem 0.5rem; border-radius:4px; font-size:0.75rem; }
+  .badge-blue { background:#1f3a5f; color:#388bfd; }
+  .badge-green { background:#1a3a2a; color:#23c55e; }
+</style>
+</head>
+<body>
+<h1>&#9646; Relay Server Metrics</h1>
+<div class="sub">Uptime: %.0fs &nbsp;|&nbsp; Auto-refreshes every 3s &nbsp;|&nbsp; <a href="/metrics" style="color:#388bfd">JSON</a></div>
+<div class="grid">
+  <div class="card"><div class="val green">%d</div><div class="lbl">Active Connections</div></div>
+  <div class="card"><div class="val">%d</div><div class="lbl">Total Connections</div></div>
+  <div class="card"><div class="val green">%d</div><div class="lbl">Active Swarms</div></div>
+  <div class="card"><div class="val green">%d</div><div class="lbl">Total Peers Online</div></div>
+  <div class="card"><div class="val">%d</div><div class="lbl">Goroutines</div></div>
+  <div class="card"><div class="val">%d</div><div class="lbl">Files Relayed</div></div>
+  <div class="card"><div class="val">%.2f MB</div><div class="lbl">Data Received</div></div>
+  <div class="card"><div class="val">%.2f MB</div><div class="lbl">Data Sent</div></div>
+  <div class="card"><div class="val amber">%d</div><div class="lbl">Conflicts Detected</div></div>
+</div>
+</body>
+</html>`,
+			s.UptimeSeconds,
+			s.ActiveConns, s.TotalConns,
+			s.ActiveSwarms, s.TotalPeers,
+			s.Goroutines,
+			s.FilesRelayed,
+			s.BytesReceivedMB, s.BytesSentMB,
+			s.ConflictsTotal,
+		)
+	})
+
+	fmt.Println("[METRICS] Dashboard at http://localhost:9001/")
+	http.ListenAndServe(":9001", mux)
 }
 
 var (
@@ -58,6 +190,8 @@ func main() {
 	}
 	defer listener.Close()
 	fmt.Println("[SECURE] Relay running on :9000 (TLS 1.3)")
+
+	go startMetricsServer()
 
 	for {
 		conn, err := listener.Accept()
@@ -150,18 +284,36 @@ func handleClient(conn net.Conn) {
 
 	swarm.Mu.Lock()
 	swarm.Clients[id] = client
-	swarm.Mu.Unlock()
 
-	fmt.Printf("[SECURE] %s joined swarm %s…\n", id, swarmID[:8])
+	stats.ActiveConns.Add(1)
+	stats.TotalConns.Add(1)
+
+	for tid, c := range swarm.Clients {
+		if tid != id {
+			fmt.Fprintf(c.conn, "PEER|%s|1\n", id)
+			fmt.Fprintf(conn, "PEER|%s|1\n", tid)
+		}
+	}
+
+	swarm.Mu.Unlock()
+	fmt.Printf("[SECURE] %s joined swarm %s...\n", id, swarmID[:8])
 
 	defer func() {
 		swarm.Mu.Lock()
 		delete(swarm.Clients, id)
+
+		stats.ActiveConns.Add(-1)
+
+		for tid, c := range swarm.Clients {
+			if tid != id {
+				fmt.Fprintf(c.conn, "PEER|%s|0\n", id)
+			}
+		}
+
 		swarm.Mu.Unlock()
 		fmt.Printf("[SECURE] %s left.\n", id)
 	}()
 
-	// INDEX msgs Tracking(until this is INDEX_DONE)
 	clientIndex := make(map[string]FileRecord)
 	indexingDone := false
 
@@ -182,7 +334,6 @@ func handleClient(conn net.Conn) {
 			fmt.Fprintf(conn, "PONG\n")
 
 		case "INDEX":
-			// INDEX|filename|size|hash
 			if len(cmdParts) < 4 {
 				continue
 			}
@@ -197,32 +348,45 @@ func handleClient(conn net.Conn) {
 			}
 			indexingDone = true
 
-			// Client's and Swarm's Index merged
 			swarm.Mu.Lock()
-			var clientNeeds []string
+			pushMap := make(map[string][]string)
+
 			for name, swarmRecord := range swarm.Index {
 				clientRecord, clientHas := clientIndex[name]
 				if !clientHas || clientRecord.Hash != swarmRecord.Hash {
-					clientNeeds = append(clientNeeds, name)
+					if swarmRecord.OwnerID != id {
+						pushMap[swarmRecord.OwnerID] = append(pushMap[swarmRecord.OwnerID], name)
+					}
 				}
 			}
-
+			// Merge this client's index into the swarm index
 			for name, rec := range clientIndex {
-				swarm.Index[name] = rec
+				if _, exists := swarm.Index[name]; !exists {
+					swarm.Index[name] = rec
+				}
+			}
+			type pushJob struct {
+				conn  net.Conn
+				files []string
+			}
+			var jobs []pushJob
+			for ownerID, files := range pushMap {
+				if ownerClient, ok := swarm.Clients[ownerID]; ok {
+					jobs = append(jobs, pushJob{conn: ownerClient.conn, files: files})
+				}
 			}
 			swarm.Mu.Unlock()
 
-			// Tell Client which file is needed to send
-			if len(clientNeeds) == 0 {
-				fmt.Fprintf(conn, "INDEX_ACK|\n")
-				fmt.Printf("[INDEX] %s is up to date.\n", id)
-			} else {
-				fmt.Fprintf(conn, "INDEX_ACK|%s\n", strings.Join(clientNeeds, ","))
-				fmt.Printf("[INDEX] %s needs %d file(s) from swarm.\n", id, len(clientNeeds))
+			for _, job := range jobs {
+				for _, fileName := range job.files {
+					fmt.Fprintf(job.conn, "PUSH|%s\n", fileName)
+					fmt.Printf("[INDEX] Requesting '%s' from owner for new peer.\n", fileName)
+				}
 			}
 
+			fmt.Fprintf(conn, "INDEX_ACK|\n")
+
 		case "SYNC":
-			// SYNC|filename|size|hash
 			if len(cmdParts) < 4 {
 				continue
 			}
@@ -235,8 +399,7 @@ func handleClient(conn net.Conn) {
 				return
 			}
 
-			// Conflict detection(swarm has file w/ a diff hash +
-			// sender dont have current version)
+			swarm.Mu.RLock()
 			existing, fileKnown := swarm.Index[name]
 			swarm.Mu.RUnlock()
 
@@ -249,17 +412,33 @@ func handleClient(conn net.Conn) {
 				return
 			}
 
-			// Update swarm index
 			swarm.Mu.Lock()
 			swarm.Index[name] = FileRecord{Size: size, Hash: hash, OwnerID: id}
 			swarm.Mu.Unlock()
 
+			swarm.Mu.RLock()
+			var targets []*Client
+			for tid, c := range swarm.Clients {
+				if tid != id {
+					targets = append(targets, c)
+				}
+			}
+			senderClient := swarm.Clients[id]
+			swarm.Mu.RUnlock()
+
 			if isConflict {
-				fmt.Printf("[CONFLICT] %s — existing=%s… incoming=%s…\n", name, existing.Hash[:8], hash[:8])
-				broadcastConflict(swarm, id, name, existing.Hash, hash)
+				stats.ConflictsTotal.Add(1)
+
+				fmt.Printf("[CONFLICT] %s — existing=%s... incoming=%s...\n", name, existing.Hash[:8], hash[:8])
+				for _, t := range targets {
+					fmt.Fprintf(t.conn, "CONFLICT|%s|%s|%s\n", name, existing.Hash, hash)
+				}
+				if senderClient != nil {
+					fmt.Fprintf(senderClient.conn, "CONFLICT|%s|%s|%s\n", name, existing.Hash, hash)
+				}
 			}
 
-			broadcastFile(swarm, id, name, size, hash, spooledPath)
+			broadcastFile(targets, name, size, hash, spooledPath)
 			os.Remove(spooledPath)
 
 		case "DELETE":
@@ -267,10 +446,23 @@ func handleClient(conn net.Conn) {
 				continue
 			}
 			name := sanitizePath(cmdParts[1])
+
 			swarm.Mu.Lock()
 			delete(swarm.Index, name)
 			swarm.Mu.Unlock()
-			broadcastDelete(swarm, id, name)
+
+			swarm.Mu.RLock()
+			var targets []net.Conn
+			for tid, c := range swarm.Clients {
+				if tid != id {
+					targets = append(targets, c.conn)
+				}
+			}
+			swarm.Mu.RUnlock()
+
+			for _, t := range targets {
+				fmt.Fprintf(t, "DELETE|%s\n", name)
+			}
 		}
 	}
 }
@@ -279,6 +471,7 @@ func spoolFile(name string, size int64, src net.Conn) (string, error) {
 	tmp, err := os.CreateTemp("", "relay-*.tmp")
 	if err != nil {
 		io.CopyN(io.Discard, src, size)
+
 		return "", err
 	}
 	path := tmp.Name()
@@ -292,22 +485,17 @@ func spoolFile(name string, size int64, src net.Conn) (string, error) {
 		os.Remove(path)
 		return "", err
 	}
-	// Spooling metrics
+
+	stats.BytesReceived.Add(size)
+
 	dur := time.Since(start).Seconds()
-	fmt.Printf("[METRIC] Spool %.2fs @ %.2f MB/s\n", dur, (float64(size)/1024/1024)/dur)
+	if dur > 0 {
+		fmt.Printf("[METRIC] Spool %.2fs @ %.2f MB/s\n", dur, (float64(size)/1024/1024)/dur)
+	}
 	return path, nil
 }
 
-func broadcastFile(swarm *Swarm, senderID, fileName string, size int64, hash string, spooledPath string) {
-	swarm.Mu.RLock()
-	var targets []net.Conn
-	for id, c := range swarm.Clients {
-		if id != senderID {
-			targets = append(targets, c.conn)
-		}
-	}
-	swarm.Mu.RUnlock()
-
+func broadcastFile(targets []*Client, fileName string, size int64, hash string, spooledPath string) {
 	if len(targets) == 0 {
 		fmt.Println("[SERVER] No peers to broadcast to.")
 		return
@@ -319,44 +507,26 @@ func broadcastFile(swarm *Swarm, senderID, fileName string, size int64, hash str
 
 	for _, target := range targets {
 		wg.Add(1)
-		go func(conn net.Conn) {
+		go func(c *Client) {
 			defer wg.Done()
 			f, err := os.Open(spooledPath)
 			if err != nil {
 				return
 			}
 			defer f.Close()
-			// Hash included in SYNC(verify both side)
-			fmt.Fprintf(conn, "SYNC|%s|%d|%s\n", fileName, size, hash)
-			io.Copy(conn, f)
+			fmt.Fprintf(c.conn, "SYNC|%s|%d|%s\n", fileName, size, hash)
+			io.Copy(c.conn, f)
 		}(target)
 	}
 
 	wg.Wait()
+
+	stats.BytesSent.Add(size * int64(len(targets)))
+	stats.FilesRelayed.Add(1)
+
 	dur := time.Since(start).Seconds()
-	fmt.Printf("[METRIC] Fan-out %.2fs @ %.2f MB/s/node\n", dur, (float64(size)/1024/1024)/dur)
-}
-
-func broadcastConflict(swarm *Swarm, senderID, fileName, existingHash, incomingHash string) {
-	swarm.Mu.RLock()
-	defer swarm.Mu.RUnlock()
-	for id, c := range swarm.Clients {
-		if id != senderID {
-			fmt.Fprintf(c.conn, "CONFLICT|%s|%s|%s\n", fileName, existingHash, incomingHash)
-		}
-	}
-	if sender, ok := swarm.Clients[senderID]; ok {
-		fmt.Fprintf(sender.conn, "CONFLICT|%s|%s|%s\n", fileName, existingHash, incomingHash)
-	}
-}
-
-func broadcastDelete(swarm *Swarm, senderID, fileName string) {
-	swarm.Mu.RLock()
-	defer swarm.Mu.RUnlock()
-	for id, c := range swarm.Clients {
-		if id != senderID {
-			fmt.Fprintf(c.conn, "DELETE|%s\n", fileName)
-		}
+	if dur > 0 {
+		fmt.Printf("[METRIC] Fan-out %.2fs @ %.2f MB/s/node\n", dur, (float64(size)/1024/1024)/dur)
 	}
 }
 
