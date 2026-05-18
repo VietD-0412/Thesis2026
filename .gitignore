@@ -1,5 +1,5 @@
 TDM-GCC/
 .stfolder/
 .vscode/
-server.crt/
-server.key/
+*.crt
+*.key
