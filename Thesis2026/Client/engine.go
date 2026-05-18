@@ -20,6 +20,8 @@ import (
 
 var downloadCache sync.Map
 var localIndex sync.Map
+var sentIndex sync.Map
+var sendMutex sync.Mutex
 
 var (
 	activeConn    net.Conn
@@ -30,6 +32,7 @@ var (
 var UIProgressCallback func(float64)
 var UILogCallback func(string)
 var UIDisconnectCallback func()
+var UIPeerCallback func(peerID string, online bool)
 
 type ProgressReader struct {
 	Reader   io.Reader
@@ -78,8 +81,12 @@ func sendHeartbeats() {
 			engineMutex.Unlock()
 			return
 		}
-		_, err := fmt.Fprintf(activeConn, "PING\n")
 		engineMutex.Unlock()
+
+		sendMutex.Lock()
+		_, err := fmt.Fprintf(activeConn, "PING\n")
+		sendMutex.Unlock()
+
 		if err != nil {
 			logMsg("[SYSTEM] Heartbeat failed.\n")
 			return
@@ -93,6 +100,8 @@ func buildAndSendIndex(conn net.Conn, folderPath string) {
 		logMsg("[INDEX] Cannot read folder: %v\n", err)
 		return
 	}
+	sendMutex.Lock()
+	defer sendMutex.Unlock()
 	for _, e := range entries {
 		if e.IsDir() || strings.Contains(e.Name(), "~") {
 			continue
@@ -186,9 +195,13 @@ func watchAndSend(conn net.Conn, folderPath string, watcher *fsnotify.Watcher) {
 			if event.Op&fsnotify.Remove == fsnotify.Remove {
 				fileName := filepath.Base(event.Name)
 				localIndex.Delete(fileName)
+				sentIndex.Delete(fileName)
 				logMsg("\n[WATCHER] Deleted locally: %s", fileName)
+				sendMutex.Lock()
 				fmt.Fprintf(conn, "DELETE|%s\n", fileName)
+				sendMutex.Unlock()
 			}
+
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
@@ -224,10 +237,19 @@ func sendFile(conn net.Conn, filePath string) {
 		return
 	}
 
-	if stored, ok := localIndex.Load(info.Name()); ok && stored.(string) == hash {
-		return
+	if stored, ok := localIndex.Load(info.Name()); ok {
+		if stored.(string) == hash {
+			if sentBefore, ok2 := sentIndex.Load(info.Name()); ok2 && sentBefore.(string) == hash {
+				return
+			}
+		}
 	}
+
 	localIndex.Store(info.Name(), hash)
+	sentIndex.Store(info.Name(), hash)
+
+	sendMutex.Lock()
+	defer sendMutex.Unlock()
 
 	fmt.Fprintf(conn, "SYNC|%s|%d|%s\n", info.Name(), info.Size(), hash)
 
@@ -337,6 +359,35 @@ func receiveLoop(conn net.Conn, saveFolder string) {
 			if dur > 0 {
 				speed := (float64(fileSize) / (1024 * 1024)) / dur
 				logMsg("[NETWORK] Synced %s in %.2fs (%.2f MB/s)\n", fileName, dur, speed)
+			}
+
+		case "PUSH":
+			if len(parts) < 2 {
+				continue
+			}
+			fileName := parts[1]
+			logMsg("[SYNC] Server requests push: %s\n", fileName)
+			go func() {
+				engineMutex.Lock()
+				c := activeConn
+				engineMutex.Unlock()
+				if c == nil {
+					return
+				}
+				fullPath := filepath.Join(saveFolder, fileName)
+				// Force resend even if sentIndex has it, since a new peer needs it
+				sentIndex.Delete(fileName)
+				sendFile(c, fullPath)
+			}()
+
+		case "PEER":
+			// PEER|machineID|online(online = "1" or "0")
+			if len(parts) < 3 {
+				continue
+			}
+			online := parts[2] == "1"
+			if UIPeerCallback != nil {
+				UIPeerCallback(parts[1], online)
 			}
 
 		case "INDEX_ACK":
